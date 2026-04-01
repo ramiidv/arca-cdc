@@ -50,7 +50,7 @@
     "type": "git",
     "url": "git+https://github.com/ramiidv/arca-cdc.git"
   },
-  "homepage": "https://github.com/ramiidv/arca-cdc#readme",
+  "homepage": "https://arca-sdk.dev/cdc",
   "bugs": {
     "url": "https://github.com/ramiidv/arca-cdc/issues"
   },
