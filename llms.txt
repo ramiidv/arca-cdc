@@ -1,0 +1,183 @@
+# @ramiidv/arca-cdc
+
+> TypeScript SDK for ARCA (formerly AFIP) WSCDC web service - Constatacion de Comprobantes.
+> Verifies whether received invoices were actually authorized by ARCA. Validates CAE, CAI, or CAEA codes. Read-only service.
+
+## Install
+
+```bash
+npm install @ramiidv/arca-cdc
+```
+
+Requires Node.js >= 18. Uses native `fetch` (no axios/node-fetch dependency). ESM only.
+
+## Architecture
+
+The SDK has two API levels:
+
+1. **High-level API** (`ArcaCdc`) - orchestrator that handles WSAA authentication automatically.
+2. **Low-level API** (`CdcClient`) - wraps each WSCDC SOAP method directly. Callers provide auth.
+
+Internally:
+- `ArcaCdc` (main class) - orchestrator, holds config, exposes all methods
+- `WsaaClient` (from `@ramiidv/arca-common`) - handles WSAA authentication, token caching with dedup and expiry margin
+- `CdcClient` - wraps all WSCDC SOAP calls using `afipSoapCall` from common
+- Error classes from `@ramiidv/arca-common`: `ArcaAuthError`, `ArcaServiceError`, `ArcaSoapError`, `ArcaError`
+
+WSCDC is a .NET/ASMX SOAP service. Namespace: `http://ar.gov.afip.dif.fev1/` (same as WSFE).
+WSAA service name: `wscdc`.
+
+## Quick start
+
+```typescript
+import fs from "fs";
+import { ArcaCdc } from "@ramiidv/arca-cdc";
+
+const cdc = new ArcaCdc({
+  cuit: 20123456789,
+  cert: fs.readFileSync("./cert.crt", "utf-8"),
+  key: fs.readFileSync("./key.key", "utf-8"),
+  production: false,
+});
+
+const result = await cdc.constatar({
+  CbteTipo: 1,
+  PtoVta: 1,
+  CbteNro: 150,
+  CbteFch: "20260315",
+  ImpTotal: 12100,
+  CodAutorizacion: "73429843294823",
+  DocTipoReceptor: 80,
+  DocNroReceptor: 30712345678,
+});
+// result.Resultado: "A" (Aprobado) or "R" (Rechazado)
+```
+
+## Configuration
+
+```typescript
+new ArcaCdc({
+  cuit: number,               // CUIT without hyphens
+  cert: string,               // X.509 certificate PEM content
+  key: string,                // Private key PEM content
+  production?: boolean,       // Default: false (uses homologacion/testing endpoints)
+  timeout?: number,           // Default: 30000 (30 seconds). Uses AbortController.
+  retries?: number,           // Default: 1. Retries on transient errors (timeout, 5xx).
+  retryDelayMs?: number,      // Default: 1000. Exponential backoff: delay * 2^attempt.
+  onEvent?: (event: ArcaEvent) => void, // Callback for all SDK events
+})
+```
+
+## Methods
+
+### constatar(input): Promise<ConstatarResult>
+
+Verify whether a comprobante was authorized by ARCA. Validates CAE, CAI, or CAEA codes.
+
+```typescript
+interface ConstatarInput {
+  CbteTipo: number;          // Voucher type
+  PtoVta: number;            // Point of sale
+  CbteNro: number;           // Voucher number
+  CbteFch: string;           // Date (YYYYMMDD)
+  ImpTotal: number;          // Total amount
+  CodAutorizacion: string;   // Authorization code (CAE/CAI/CAEA)
+  DocTipoReceptor: number;   // Receiver document type (80=CUIT, 96=DNI, 99=CF)
+  DocNroReceptor: number;    // Receiver document number
+}
+
+interface ConstatarResult {
+  Resultado: "A" | "R";                         // A=Approved, R=Rejected
+  Observaciones?: { Code: number; Msg: string }[];  // Rejection details
+  Errors?: { Code: number; Msg: string }[];          // Service errors
+}
+```
+
+### status(): Promise<ServerStatus>
+
+Health check. No auth needed. Returns `{ appserver, dbserver, authserver }`.
+
+### getModalidades(): Promise<ModalidadItem[]>
+
+Query enabled billing modalities. Returns `{ Id, Desc, FchDesde?, FchHasta? }[]`.
+
+### getTiposCbte(): Promise<TipoCbteItem[]>
+
+Query enabled voucher types. Returns `{ Id, Desc, FchDesde?, FchHasta? }[]`.
+
+### getDocTipos(): Promise<DocTipoItem[]>
+
+Query enabled document types. Returns `{ Id, Desc, FchDesde?, FchHasta? }[]`.
+
+### clearAuthCache(): void
+
+Invalidate cached WSAA access tickets.
+
+## Low-level client
+
+Accessible as `cdc.client` and `cdc.wsaa`:
+
+```typescript
+const ticket = await cdc.wsaa.getAccessTicket("wscdc");
+const auth = { Token: ticket.token, Sign: ticket.sign, Cuit: 20123456789 };
+const result = await cdc.client.constatar(auth, input);
+await cdc.client.dummy();
+await cdc.client.getModalidades(auth);
+await cdc.client.getTiposCbte(auth);
+await cdc.client.getDocTipos(auth);
+```
+
+## Error handling
+
+```typescript
+import { ArcaAuthError, ArcaServiceError, ArcaSoapError } from "@ramiidv/arca-cdc";
+
+try {
+  await cdc.constatar({ ... });
+} catch (e) {
+  if (e instanceof ArcaAuthError) {
+    // WSAA login failed (bad cert, expired, etc.)
+    cdc.clearAuthCache();
+  }
+  if (e instanceof ArcaServiceError) {
+    // ARCA business error with codes
+    e.errors; // { code: number, msg: string }[]
+  }
+  if (e instanceof ArcaSoapError) {
+    // HTTP/SOAP transport error (timeout, 500, SOAP fault)
+    e.statusCode; // number | undefined
+  }
+}
+```
+
+All error classes extend `ArcaError` which extends `Error`.
+
+## Events
+
+Discriminated union `ArcaEvent`:
+- `auth:login` - new token obtained. Fields: `service`, `durationMs`
+- `auth:cache-hit` - cached token reused. Fields: `service`
+- `request:start` - SOAP call starting. Fields: `method`, `endpoint`
+- `request:end` - SOAP call completed. Fields: `method`, `durationMs`
+- `request:retry` - retrying after error. Fields: `method`, `attempt`, `error`
+- `request:error` - request failed. Fields: `method`, `error`
+
+## Endpoints
+
+| Environment | WSAA | WSCDC |
+| --- | --- | --- |
+| Testing | `wsaahomo.afip.gov.ar` | `wswhomo.afip.gov.ar/WSCDC/service.asmx` |
+| Production | `wsaa.afip.gov.ar` | `servicios1.arca.gob.ar/WSCDC/service.asmx` |
+
+## Constants exported
+
+- `WSCDC_ENDPOINTS` - `{ testing, production }` endpoint URLs
+- `WSCDC_NAMESPACE` - `"http://ar.gov.afip.dif.fev1/"` SOAP namespace
+- `WSCDC_SERVICE_ID` - `"wscdc"` WSAA service identifier
+
+## Utilities re-exported from common
+
+- `ensureArray<T>(value): T[]` - normalizes single/array SOAP responses
+- `parseXml(xml): Record<string, unknown>` - parse XML with CUIT-safe options
+- `buildXml(obj): string` - build XML from object
+- `checkServiceErrors(result, serviceName): void` - throws ArcaServiceError if errors found
